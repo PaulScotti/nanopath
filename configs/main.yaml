@@ -1,86 +1,61 @@
-project:
-  name: main-dinov2
-  family: nanopath
-  recipe_id: dinov2-vits14-reg-kde
-  output_dir: /data/$USER/nanopath/main/default
-  wandb_dir: /data/$USER/nanopath/wandb
-
 data:
-  # dataset_dir holds the parquet shards (shard-NNNNN.parquet) that train.py reads.
-  # `prepare.py … download=True` populates it from the medarc/nanopath HF mirror.
+  color_jitter: 0.3
+  color_jitter_saturation: 0.3
   dataset_dir: /data/nanopath_parquet
-  split_seed: 42
+  global_crop_scale:
+  - 0.4
+  - 1.0
+  hed_jitter: 0.07
+  local_crop_scale:
+  - 0.08
+  - 0.35
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  split_seed: 7777
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+  tissue_thresh: 0.0
   val_fraction: 0.05
-  mean: [0.485, 0.456, 0.406]
-  std: [0.229, 0.224, 0.225]
-  global_crop_scale: [0.2, 1.0]
-  local_crop_scale: [0.03, 0.25]
-  color_jitter: 0.45
-  color_jitter_saturation: 0.4
-  hed_jitter: 0.12
-  tissue_thresh: 0.5 # training rejects tiles unless this fraction of pixels has RGB saturation > 0.07
-
+dino:
+  adam_beta2: 0.999
+  clip_grad: 3.0
+  drop_path_rate: 0.1
+  freeze_backbone_fraction: 0.0
+  freeze_last_layer_fraction: 0.0091
+  head_bottleneck_dim: 384
+  head_hidden_dim: 2048
+  jepa_block_scale: 0.1
+  jepa_blocks: 4
+  jepa_pred_depth: 4
+  jepa_pred_width: 0
+  kde_concentration: 10.0
+  kde_loss_weight: 0.005
+  layerwise_decay: 0.7
+  lr: 0.000125
+  lr_min: 1.0e-06
+  patch_embed_lr_mult: 0.2
+  warmup_fraction: 0.0909
+fino:
+  continuous:
+  - - expr512
+    - 1
+  - - fga
+    - 1
+  discrete:
+  - - subtype
+    - 1
+  enabled: true
+  gamma_max: 0.7
 model:
   type: dinov2_vits14_reg
-
-train:
-  seed: 1337
-  bf16: true
-  activation_checkpointing: false
-  batch_size: 128
-  num_workers: 16
-  prefetch_factor: 2
-  persistent_workers: true
-  max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
-  max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
-  log_every: 20
-  save_every: 1000
-  # Validation pass every `eval_every` steps over `val_batches` held-out batches
-  eval_every: 200
-  val_batches: 16
-  global_views: 2
-  local_views: 8
-  global_size: 224
-  local_size: 98
-  resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
-
-dino:
-  lr: 1.0e-4
-  lr_min: 1.0e-6
-  adam_beta2: 0.99
-  warmup_fraction: 0.03
-  freeze_last_layer_fraction: 0.0091
-  layerwise_decay: 0.7
-  patch_embed_lr_mult: 0.2
-  drop_path_rate: 0.1
-  head_hidden_dim: 2048
-  head_bottleneck_dim: 384
-  clip_grad: 3.0
-  kde_loss_weight: 0.005
-  kde_concentration: 10.0
-
 probe:
-  enabled: true
-  model_weights: ema
-  count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
-  datasets:
-    - bracs
-    - break_his
-    - mhist
-    - pcam
-  segmentation_datasets:
-    - pannuke
-    - monusac
-    - consep
-  slide_datasets:
-    - ucla_lung
   auc_datasets:
-    - surgen
-  survival_datasets:
-    - leopard_bcr
-    - cptac_pda_os
-  robustness_datasets:
-    - pathorob
+  - surgen
+  count: 1
   dataset_roots:
     bracs: /block/eva-data/bracs
     break_his: /block/eva-data/breakhis
@@ -89,8 +64,51 @@ probe:
     leopard_bcr: /data/leopard_bcr
     mhist: /block/eva-data/mhist
     monusac: /block/eva-data/monusac
-    pcam: /block/eva-data/patch_camelyon
     pannuke: /block/thunder-data/pannuke
     pathorob: /block/pathorob
+    pcam: /block/eva-data/patch_camelyon
     surgen: /data/surgen
     ucla_lung: /data/ucla-lung
+  datasets:
+  - bracs
+  - break_his
+  - mhist
+  - pcam
+  enabled: true
+  model_weights: ema
+  robustness_datasets:
+  - pathorob
+  segmentation_datasets:
+  - pannuke
+  - monusac
+  - consep
+  slide_datasets:
+  - ucla_lung
+  survival_datasets:
+  - leopard_bcr
+  - cptac_pda_os
+project:
+  family: nanopath
+  name: ryan-validation-s12
+  output_dir: /data/$USER/nanopath/ryan-validation/s12
+  recipe_id: dinov2-vits14-reg-jepa-mask10
+  wandb_dir: /data/$USER/nanopath/wandb
+train:
+  activation_checkpointing: false
+  batch_size: 128
+  bf16: true
+  eval_every: 200
+  global_size: 224
+  global_views: 2
+  local_size: 112
+  local_views: 8
+  log_every: 20
+  max_train_flops: 1000000000000000000
+  max_train_samples: 1000000
+  num_workers: 16
+  persistent_workers: true
+  prefetch_factor: 2
+  resume: null
+  save_every: 1000
+  seed: 12
+  val_batches: 16
