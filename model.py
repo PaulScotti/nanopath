@@ -6,7 +6,7 @@
 # a strict load.
 #
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
-# DINO CLS / iBOT patch self-distillation losses. It is intentionally trivial
+# DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
 import torch
@@ -44,6 +44,15 @@ class DropPath(nn.Module):
 class LayerScale(nn.Module):
     def __init__(self, dim): super().__init__(); self.gamma = nn.Parameter(torch.ones(dim))
     def forward(self, x): return x * self.gamma
+
+
+# FINO gradient gate: identity forward, scales the gradient by `scale` on backward. sign>0 encourages the
+# encoder to predict a metadata factor (M+); sign<0 reverses the gradient to suppress it (M-, DANN-style).
+class GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale): ctx.scale = scale; return x
+    @staticmethod
+    def backward(ctx, g): return g * ctx.scale, None
 
 
 # Attention with single qkv Linear + F.scaled_dot_product_attention (Flash-2 backend on H100 bf16).
@@ -133,7 +142,7 @@ class DinoV2ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches] tokens; iBOT swaps the masked patch positions for mask_token.
+    # Build [cls, registers, patches] tokens; masked patch positions are replaced by mask_token.
     def _prepare_tokens(self, x, masks=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
@@ -164,14 +173,35 @@ class DinoV2ViT(nn.Module):
             "x_norm_patchtokens": x[:, 1 + self.registers :],
         }
 
-    # Probe contract: encode_image returns [registers || patches] for the seg head;
-    # probe_features returns the cls token for classification probes.
+    # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
+    # and strided-depth CLS features that are less tied to the final DINO head.
     def encode_image(self, x, checkpoint=False):
-        out = self(x, checkpoint=checkpoint)
-        return torch.cat([out["x_norm_regtokens"], out["x_norm_patchtokens"]], dim=1)
+        B, _, H, W = x.shape
+        h, w, G = H // self.patch_size, W // self.patch_size, 32
+        guide = x.mean(1, keepdim=True)
+        guide = (guide - guide.amin((2, 3), keepdim=True)) / (guide.amax((2, 3), keepdim=True) - guide.amin((2, 3), keepdim=True) + 1e-6)
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = torch.utils.checkpoint.checkpoint(blk, xt, use_reentrant=False) if checkpoint and self.training else blk(xt)
+            if i >= len(self.blocks) - 4:
+                feats.append(self.norm(xt)[:, 1:])
+        fused = torch.cat(feats, -1)
+        regs, patches = fused[:, :self.registers], fused[:, self.registers:]
+        up = F.interpolate(patches.transpose(1, 2).reshape(B, patches.shape[-1], h, w).float(), size=(G, G), mode="bilinear", align_corners=False)
+        guide_lr = F.interpolate(guide, size=(h, w), mode="area")
+        guide_hr = F.interpolate(guide, size=(G, G), mode="area")
+        w_range = torch.exp(-((guide_hr - F.interpolate(guide_lr, size=(G, G), mode="nearest")).abs() ** 2) / 0.02)
+        blur = F.avg_pool2d(F.pad(up, (1, 1, 1, 1), mode="replicate"), 3, 1)
+        dense = (up + (1 - w_range) * (up - blur)).flatten(2).transpose(1, 2).to(fused.dtype)
+        return torch.cat([regs, dense], dim=1)
 
     def probe_features(self, x):
-        return self(x)["x_norm_clstoken"]
+        xt, feats = self._prepare_tokens(x), []
+        for i, blk in enumerate(self.blocks):
+            xt = blk(xt)
+            if i in (4, 6, 8, 11):
+                feats.append(self.norm(xt)[:, 0])
+        return torch.cat(feats, dim=-1)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
@@ -183,7 +213,7 @@ def load_dinov2_pretrained(model):
     return model
 
 
-# DINO/iBOT projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
+# DINO projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
 # weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
 # behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
 class DINOHead(nn.Module):
@@ -205,3 +235,26 @@ class DINOHead(nn.Module):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
         return self.last_layer(x)
+
+
+# I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's
+# block-masked patch tokens. FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
+# of a discrete metadata factor to every patch token, so the latent-regression target is metadata-aware
+# (a dense-path alternative to CLS-token steering). n_cond=0 is plain I-JEPA.
+class JEPAPredictor(nn.Module):
+    def __init__(self, dim, depth=4, width=0, heads=6, n_cond=0):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.cond_emb = nn.Embedding(n_cond + 1, width) if n_cond else None
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim, bias=True)
+
+    def forward(self, patch_tokens, cond=None):
+        x = self.proj_in(patch_tokens)
+        if self.cond_emb is not None and cond is not None:
+            x = x + self.cond_emb(cond + 1).unsqueeze(1)  # broadcast factor embedding over patches; cond=-1 -> idx 0
+        for blk in self.blocks:
+            x = blk(x)
+        return self.proj(self.norm(x))
