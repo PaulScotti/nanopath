@@ -28,7 +28,7 @@ dino:
   freeze_last_layer_fraction: 0.0091
   head_bottleneck_dim: 384
   head_hidden_dim: 2048
-  jepa_block_scale: 0.1
+  jepa_block_scale: 0.12
   jepa_blocks: 4
   jepa_pred_depth: 4
   jepa_pred_width: 0
