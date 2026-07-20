@@ -22,7 +22,7 @@ data:
   val_fraction: 0.05
 dino:
   adam_beta2: 0.999
-  clip_grad: 3.0
+  clip_grad: 2.5
   drop_path_rate: 0.1
   freeze_backbone_fraction: 0.0
   freeze_last_layer_fraction: 0.0091
