@@ -110,5 +110,5 @@ train:
   prefetch_factor: 2
   resume: null
   save_every: 1000
-  seed: 12
+  seed: 20260720
   val_batches: 16
