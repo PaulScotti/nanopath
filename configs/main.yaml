@@ -100,8 +100,8 @@ train:
   eval_every: 200
   global_size: 224
   global_views: 2
-  local_size: 112
-  local_views: 8
+  local_size: 128
+  local_views: 14
   log_every: 20
   max_train_flops: 1000000000000000000
   max_train_samples: 1000000
