@@ -33,7 +33,7 @@ dino:
   jepa_pred_depth: 4
   jepa_pred_width: 0
   kde_concentration: 10.0
-  kde_loss_weight: 0.005
+  kde_loss_weight: 0.0025
   layerwise_decay: 0.7
   lr: 0.000125
   lr_min: 1.0e-06
