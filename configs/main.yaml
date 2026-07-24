@@ -33,7 +33,7 @@ dino:
   jepa_pred_depth: 4
   jepa_pred_width: 0
   kde_concentration: 10.0
-  kde_loss_weight: 0.005
+  kde_loss_weight: 0.05
   layerwise_decay: 0.7
   lr: 0.000125
   lr_min: 1.0e-06
@@ -100,8 +100,8 @@ train:
   eval_every: 200
   global_size: 224
   global_views: 2
-  local_size: 112
-  local_views: 8
+  local_size: 128
+  local_views: 14
   log_every: 20
   max_train_flops: 1000000000000000000
   max_train_samples: 1000000
