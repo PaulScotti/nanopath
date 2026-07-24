@@ -95,7 +95,7 @@ project:
   wandb_dir: /data/$USER/nanopath/wandb
 train:
   activation_checkpointing: false
-  batch_size: 128
+  batch_size: 64
   bf16: true
   eval_every: 200
   global_size: 224
