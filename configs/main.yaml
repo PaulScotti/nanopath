@@ -93,6 +93,9 @@ project:
   output_dir: /data/$USER/nanopath/ryan-validation/s12
   recipe_id: dinov2-vits14-reg-jepa-mask10
   wandb_dir: /data/$USER/nanopath/wandb
+replication:
+  base_config_sha256: c7c98ffacde7d393811c8a1742f36e7dfc4134731aa1cd34b304c24fc13fc92d
+  base_run_id: run_sub_59d24d6b7b
 train:
   activation_checkpointing: false
   batch_size: 128
@@ -110,5 +113,5 @@ train:
   prefetch_factor: 2
   resume: null
   save_every: 1000
-  seed: 12
+  seed: 20260720
   val_batches: 16

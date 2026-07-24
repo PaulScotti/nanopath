@@ -772,6 +772,8 @@ def main():
         "project": cfg["project"]["name"],
         "family": cfg["project"]["family"],
         "recipe_id": cfg["project"]["recipe_id"],
+        "replication": cfg["replication"],
+        "train_seed": train_cfg["seed"],
         "config_path": cfg["config_path"],
         "wandb": wandb_meta,
         "slurm_job_id": slurm_job_id,
