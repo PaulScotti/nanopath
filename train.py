@@ -3,7 +3,7 @@
 # I-JEPA patch-feature regression, and a KDE uniformity term on the
 # L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
 # LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
-# FLOP/sample budgets, batch size); other DINOv2 hyperparameters are hardcoded
+# FLOP/sample budgets, batch size, online hard-sample fraction); other DINOv2 hyperparameters are hardcoded
 # inline at their use sites.
 
 import atexit
@@ -439,9 +439,31 @@ def main():
 
     # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+    def compute_losses(gf, lf, b, masks, t_temp, k_scale, ckpt=False, meta=None, cond=None, hard_fraction=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
+            hard_distance = None
+            if hard_fraction is not None:
+                # Explicit online proxy, not dataset-cluster distance: spherical k-means on this batch's
+                # two-view-mean EMA embeddings, then retain tiles farthest from their assigned local centroid.
+                emb = F.normalize(t["x_norm_clstoken"].view(train_cfg["global_views"], b, -1).mean(0).float(), dim=-1)
+                centroids = emb[torch.linspace(0, b - 1, min(8, b), device=device).long()]
+                for _ in range(3):
+                    assign = (emb @ centroids.T).argmax(1)
+                    sums = torch.zeros_like(centroids).index_add_(0, assign, emb)
+                    centroids = F.normalize(torch.where(torch.bincount(assign, minlength=len(centroids))[:, None] > 0, sums, centroids), dim=-1)
+                assign = (emb @ centroids.T).argmax(1)
+                hard_distance = 1 - (emb * centroids[assign]).sum(1)
+                keep = hard_distance.topk(math.ceil(b * hard_fraction)).indices.sort().values
+                hard_distance = hard_distance[keep]
+                G, L = train_cfg["global_views"], train_cfg["local_views"]
+                t = {k: v.view(G, b, *v.shape[1:])[:, keep].flatten(0, 1) for k, v in t.items()}
+                gf, lf, masks = gf.view(G, b, *gf.shape[1:])[:, keep].flatten(0, 1), lf.view(L, b, *lf.shape[1:])[:, keep].flatten(0, 1), masks.view(G, b, -1)[:, keep].flatten(0, 1)
+                if meta is not None: meta = meta[0], meta[1][keep], {k: v[keep] for k, v in meta[2].items()}
+                if cond is not None: cond = cond[keep].repeat(G)
+                b = len(keep)
+            mask_idx = masks.flatten().nonzero().flatten()
+            mask_w = (1 / masks.sum(-1).clamp(min=1)).unsqueeze(-1).expand_as(masks)[masks]
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
             t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
@@ -495,7 +517,7 @@ def main():
                     meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
                 else:
                     for _, L in terms: meta_loss = meta_loss + L
-        return local_loss + global_loss, jepa_loss, kde, meta_loss
+        return local_loss + global_loss, jepa_loss, kde, meta_loss, hard_distance
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -515,8 +537,8 @@ def main():
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                masks, _, _ = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
+                dino_l, jepa_l, kde_v, _, _ = compute_losses(gf, lf, b, masks, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -571,6 +593,7 @@ def main():
     # Counts the EMA teacher forward + DINO/JEPA heads, not just the backbone, so the
     # 1e18 leaderboard cap reflects real GPU work.
     measured_flops_per_step = None
+    retained_batch_size = math.ceil(batch_size * train_cfg["online_hard_fraction"])
 
     while examples_seen + batch_size <= max_train_samples and train_flops < max_train_flops:
         for batch in train_loader:
@@ -587,7 +610,7 @@ def main():
             for key, batch_key in (("sample", "sample_idx"), ("slide", "slide_id"), ("patient", "patient_id")):
                 pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
             global_views, local_views = [batch[key].to(device, non_blocking=True) for key in ("global_views", "local_views")]
-            visible_now = batch_size * (train_cfg["global_views"] * global_patches + train_cfg["local_views"] * local_patches)
+            visible_now = retained_batch_size * (train_cfg["global_views"] * global_patches + train_cfg["local_views"] * local_patches)
             # LR warmup uses the 1M-tile sample cap; decay/WD/teacher/freeze/KDE default to the public FLOP budget.
             # But this run hits the sample cap at ~19% of the FLOP budget, so a FLOP-keyed cosine only traverses ~0.11
             # of its arc (LR never anneals, KDE peaks at 0.22, WD ~0.05). lr_key/reg_key="sample" re-key the decay/reg
@@ -608,7 +631,7 @@ def main():
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
-            masks, mask_idx, mask_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
+            masks, _, _ = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
             kde_scale = min(1.0, max(0.0, (reg_frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -626,10 +649,10 @@ def main():
                     meta = ((fino_cfg["gamma_max"] * (2.0 / (1.0 + math.exp(-10.0 * ramp)) - 1.0),
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
-                    cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
-                    dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
-                        gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing, meta=meta, cond=cond,
+                    cond = batch["meta_disc"][:, cond_col].to(device, non_blocking=True) if jepa_cond else None
+                    dino_loss_value, jepa_loss, kde, meta_loss, hard_distance = compute_losses(
+                        gf, lf, batch_size, masks, teacher_temp, kde_scale, ckpt=activation_checkpointing,
+                        meta=meta, cond=cond, hard_fraction=train_cfg["online_hard_fraction"],
                     )
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss
                 opt.zero_grad(set_to_none=True)
@@ -703,6 +726,8 @@ def main():
                     "teacher_momentum": m,
                     "kde_scale": kde_scale,
                     "batch_size": batch_size,
+                    "retained_batch_size": retained_batch_size,
+                    "online_hard_distance_mean": float(hard_distance.mean()),
                     "examples_seen": examples_seen,
                     "visible_patch_presentations": visible_patch_presentations,
                     "train_flops": train_flops,

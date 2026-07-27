@@ -89,9 +89,9 @@ probe:
   - cptac_pda_os
 project:
   family: nanopath
-  name: ryan-validation-s12
-  output_dir: /data/$USER/nanopath/ryan-validation/s12
-  recipe_id: dinov2-vits14-reg-jepa-mask10
+  name: online-hard50-s12
+  output_dir: /data/$USER/nanopath/online-hard50/s12
+  recipe_id: dinov2-vits14-reg-jepa-mask10-online-hard50
   wandb_dir: /data/$USER/nanopath/wandb
 train:
   activation_checkpointing: false
@@ -106,6 +106,8 @@ train:
   max_train_flops: 1000000000000000000
   max_train_samples: 1000000
   num_workers: 16
+  # Online proxy: retain the half-batch farthest from EMA-embedding batch-local centroids.
+  online_hard_fraction: 0.5
   persistent_workers: true
   prefetch_factor: 2
   resume: null
