@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, load_dinov2_pretrained
+from model import DINOHead, DinoV2ViT, JEPAPredictor, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -162,6 +162,21 @@ def kde_loss(x, concentration):
     return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
 
 
+# Deterministic batch-local K=8 Lloyd fit. First-eight initialization and ten updates are
+# recomputed from scratch per batch; stable ranking keeps ceil(B/2) tile identities on odd B.
+def hard_tile_indices(x):
+    x = x.float()
+    centroids = x[:8].clone()
+    for _ in range(10):
+        assignment = torch.cdist(x, centroids).argmin(1)
+        membership = F.one_hot(assignment, 8).to(x.dtype)
+        sums, counts = membership.T @ x, membership.sum(0).unsqueeze(1)
+        centroids = torch.where(counts > 0, sums / counts.clamp_min(1), centroids)
+    distances = torch.cdist(x, centroids)
+    distance = distances.gather(1, distances.argmin(1, keepdim=True)).squeeze(1)
+    return torch.argsort(distance, descending=True, stable=True)[: (x.shape[0] + 1) // 2].sort().values
+
+
 # I-JEPA target mask: contiguous square blocks so the predictor must infer missing tissue context.
 def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
     masks = torch.zeros(batch, grid, grid, dtype=torch.bool, device=device)
@@ -221,19 +236,7 @@ def main():
     labless_autosubmit_file = maybe_arm_labless_autosubmit(cfg, repo_dir)
     train_cfg = cfg["train"]
     dino_cfg = cfg["dino"]
-    # FINO metadata-guidance: select factors + signs (float; + encourage M+ / - suppress M-). fino_meta (built or
-    # copied beside the dataset by prepare.py) holds per-factor barcode maps + cardinalities (n) / vector dims.
-    fino_cfg = cfg["fino"] if (cfg.get("fino") or {}).get("enabled") else None
-    fino_disc = [(f, float(s)) for f, s in fino_cfg.get("discrete", [])] if fino_cfg else []
-    fino_cont = [(f, float(s)) for f, s in fino_cfg.get("continuous", [])] if fino_cfg else []
-    fino_meta = json.loads((Path(cfg["data"]["dataset_dir"]) / "fino_meta.json").read_text()) if fino_cfg else {"n": {}, "cont_dim": {}}
-    # FINO two-phase: freeze the backbone (except patch_embed) for the first this-fraction of the run so the DINO/JEPA
-    # heads + metadata prototypes/predictors converge against a fixed target before they steer the encoder. 0 = off.
     freeze_backbone_frac = float(dino_cfg.get("freeze_backbone_fraction", 0.0))
-    # JEPA-T: optionally condition the JEPA predictor on a discrete factor (must be in fino.discrete so its per-tile
-    # label rides in the batch). cond_col indexes that factor's column in batch["meta_disc"].
-    jepa_cond = fino_cfg.get("jepa_cond") if fino_cfg else None
-    cond_col = [f for f, _ in fino_disc].index(jepa_cond) if jepa_cond else None
     save_every = train_cfg["save_every"]
     save_checkpoints = save_every is not None
     device = torch.device("cuda")
@@ -251,22 +254,13 @@ def main():
         p.requires_grad = False
     student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
-    student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
+    student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"])).to(device)
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
-    # FINO continuous-factor predictors (phi -> vector regressors); their params join the optimizer.
-    predictors = {f: nn.Sequential(nn.Linear(student_backbone.embed_dim, 512), nn.GELU(), nn.Linear(512, 256), nn.GELU(), nn.Linear(256, fino_meta.get("cont_dim", {}).get(f, 1))).to(device) for f, _ in fino_cont}
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
     param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"])
-    if predictors:
-        param_groups.append({"params": [p for m in predictors.values() for p in m.parameters()], "lr_mult": 1.0, "wd_mult": 1.0, "last_layer": False})
     opt = torch.optim.AdamW(param_groups, lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))
-    # FINO prototype banks: one unit vector per discrete-factor value, EMA-updated from teacher CLS in compute_losses.
-    protos = {f: F.normalize(torch.randn(fino_meta["n"][f], student_backbone.embed_dim, device=device), dim=-1) for f, _ in fino_disc} if fino_cfg else {}
-    # FINO grad-equalisation EMA bank (one running grad-norm per factor); init 1.0 -> s_t~1 early. Not checkpointed
-    # (mu=0.99 -> ~100-step memory, re-warms quickly on resume). Used only when fino.grad_equalize is set.
-    grad_eq_ema = {f: torch.ones((), device=device) for f, _ in (fino_disc + fino_cont)} if fino_cfg else {}
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
@@ -299,10 +293,6 @@ def main():
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
         student_predictor.load_state_dict(checkpoint["predictor"])
         opt.load_state_dict(checkpoint["opt"])
-        if fino_cfg:
-            protos = {k: v.to(device) for k, v in checkpoint["protos"].items()}
-            for f, mdl in predictors.items():
-                mdl.load_state_dict(checkpoint["predictors"][f])
         step = int(checkpoint["step"])
         examples_seen = int(checkpoint["examples_seen"])
         visible_patch_presentations = int(checkpoint["visible_patch_presentations"])
@@ -411,8 +401,7 @@ def main():
         return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head),
                 "predictor": cpu_state(student_predictor), "opt": opt.state_dict(),
                 "examples_seen": examples_seen, "visible_patch_presentations": visible_patch_presentations,
-                "train_flops": train_flops, "wandb": wandb_meta,
-                **({"protos": {k: v.cpu() for k, v in protos.items()}, "predictors": {f: cpu_state(m) for f, m in predictors.items()}} if fino_cfg else {})}
+                "train_flops": train_flops, "wandb": wandb_meta}
 
     def save_latest_checkpoint(checkpoint_step):
         nonlocal last_saved_step
@@ -437,13 +426,19 @@ def main():
             "unique_patches_seen": unique_tiles_seen * unique_tile_patch_count,
         }
 
-    # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
-    # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+    # Score all tile identities from their mean teacher global-view CLS, then apply every
+    # gradient-bearing objective only to all global/local views of the hardest half.
+    def compute_losses(gf, lf, b, t_temp, k_scale, ckpt=False):
         with torch.no_grad():
-            t = teacher_backbone(gf)
+            t_full = teacher_backbone(gf)
+            keep = hard_tile_indices(t_full["x_norm_clstoken"].view(train_cfg["global_views"], b, -1).mean(0))
+            gi = (torch.arange(train_cfg["global_views"], device=device)[:, None] * b + keep).flatten()
+            li = (torch.arange(train_cfg["local_views"], device=device)[:, None] * b + keep).flatten()
+            t = {key: value[gi] for key, value in t_full.items()}
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
-            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
+            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, keep.numel(), -1)
+        gf, lf = gf[gi], lf[li]
+        masks, mask_idx, mask_w = make_block_mask(keep.numel() * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
@@ -451,51 +446,10 @@ def main():
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         target = F.layer_norm(t["x_norm_patchtokens"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
-        pred = student_predictor(sg["x_norm_patchtokens"], cond).flatten(0, 1)[mask_idx]
-        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
+        pred = student_predictor(sg["x_norm_patchtokens"]).flatten(0, 1)[mask_idx]
+        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, keep.numel() * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
-        # FINO metadata guidance on the CLS token (train-only; meta=None in eval), orthogonal to the JEPA patch
-        # objective. lambda_meta=0.03/branch; GradScale gates the encoder gradient by the DANN ramp gamma with the
-        # per-factor sign (+ M+ encourage / - M- suppress). fp32 island (1/tau=0.023 too sharp for bf16); missing
-        # factors masked. Discrete: L2-normed student CLS vs EMA prototype bank (clone-rebind keeps the backward-saved
-        # bank valid). Continuous: an MLP regresses the z-scored value.
-        meta_loss = sg["x_norm_clstoken"].new_zeros(())
-        if meta is not None:
-            gamma, md, mc = meta  # md (B,n_disc) int64 (-1 missing); mc {factor: (B,dim) float, nan missing}
-            phi_s = F.normalize(sg["x_norm_clstoken"].float(), dim=-1)
-            phi_t = F.normalize(t["x_norm_clstoken"].float(), dim=-1)
-            terms = []  # (factor, per-branch loss 0.03*L_t); combined below, optionally gradient-equalized
-            with torch.autocast(device_type="cuda", enabled=False):
-                for j, (f, sign) in enumerate(fino_disc):
-                    lab = md[:, j].repeat(train_cfg["global_views"]); ok = lab >= 0  # repeat, NOT interleave
-                    if ok.any():
-                        logits = (GradScale.apply(phi_s[ok], sign * gamma) @ protos[f].t()) / 0.023
-                        terms.append((f, 0.03 * F.cross_entropy(logits, lab[ok])))
-                        with torch.no_grad():
-                            pt, lt = phi_t[ok], lab[ok]
-                            upd = torch.zeros_like(protos[f]).index_add_(0, lt, pt)
-                            cnt = torch.zeros(protos[f].shape[0], 1, device=device).index_add_(0, lt, torch.ones_like(pt[:, :1]))
-                            seen = cnt.squeeze(1) > 0; new = protos[f].clone()
-                            new[seen] = F.normalize(0.99 * new[seen] + 0.01 * (upd[seen] / cnt[seen]), dim=-1); protos[f] = new
-                # FINO Eq.3 regresses continuous factors from the RAW backbone CLS; phi_s is L2-normalized (needed only
-                # for the cosine discrete branch and it strips the radial magnitude). raw_cls=True feeds the raw CLS.
-                cls_cont = sg["x_norm_clstoken"].float() if fino_cfg.get("raw_cls") else phi_s
-                for f, sign in fino_cont:
-                    val = mc[f].repeat(train_cfg["global_views"], 1); ok = ~torch.isnan(val).any(dim=1)
-                    if ok.any():
-                        cpred = predictors[f](GradScale.apply(cls_cont[ok], sign * gamma))
-                        terms.append((f, 0.03 * F.mse_loss(cpred, val[ok])))
-                # FINO Alg A.3 per-branch gradient equalisation: rescale each branch by n_bar/EMA(||dL_t/dCLS||) so the
-                # discrete-CE and continuous-MSE gradients reach the encoder at matched magnitudes (detached -> reweight
-                # only; geometric-mean target; no-op for <2 branches). grad_eq_ema = per-factor EMA bank (mu=0.99).
-                if fino_cfg.get("grad_equalize") and len(terms) > 1:
-                    g = {f: torch.autograd.grad(L, sg["x_norm_clstoken"], retain_graph=True)[0].norm() for f, L in terms}
-                    for f in g: grad_eq_ema[f] = 0.99 * grad_eq_ema[f] + 0.01 * g[f].detach().float()
-                    nbar = torch.exp(torch.stack([grad_eq_ema[f].log() for f, _ in terms]).mean())
-                    meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
-                else:
-                    for _, L in terms: meta_loss = meta_loss + L
-        return local_loss + global_loss, jepa_loss, kde, meta_loss
+        return local_loss + global_loss, jepa_loss, kde
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -515,8 +469,7 @@ def main():
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+                dino_l, jepa_l, kde_v = compute_losses(gf, lf, b, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -608,7 +561,6 @@ def main():
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
-            masks, mask_idx, mask_w = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
             kde_scale = min(1.0, max(0.0, (reg_frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -619,22 +571,13 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    # FINO DANN ramp keyed to nanopath's SAMPLE budget (NOT FLOPs — sample-capped at ~19% of the FLOP
-                    # cap, so a flop-keyed ramp stalls gamma at ~0.75*gamma_max). Counted from the backbone-unfreeze
-                    # point: gamma=0 through the frozen Phase 1 (banks warm), then ramps to full gamma_max by the cap.
-                    ramp = max(0.0, (examples_seen / max_train_samples - freeze_backbone_frac) / max(1e-6, 1.0 - freeze_backbone_frac))
-                    meta = ((fino_cfg["gamma_max"] * (2.0 / (1.0 + math.exp(-10.0 * ramp)) - 1.0),
-                             batch["meta_disc"].to(device, non_blocking=True),
-                             {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
-                    cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
-                    dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
-                        gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing, meta=meta, cond=cond,
+                    dino_loss_value, jepa_loss, kde = compute_losses(
+                        gf, lf, batch_size, teacher_temp, kde_scale, ckpt=activation_checkpointing,
                     )
-                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss
+                    total_loss = dino_loss_value + jepa_loss + kde
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
-                if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
+                if examples_seen / max_train_samples < freeze_backbone_frac:
                     for n, p in student_backbone.named_parameters():
                         if not n.startswith("patch_embed"): p.grad = None
                 grad_norm = nn.utils.clip_grad_norm_(

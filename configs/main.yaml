@@ -39,6 +39,7 @@ dino:
   lr_min: 1.0e-06
   patch_embed_lr_mult: 0.2
   warmup_fraction: 0.0909
+# Hard selection uses mean EMA-teacher global CLS, batch-local K=8, and the hardest ceil-half; FINO values stay unchanged but are ignored.
 fino:
   continuous:
   - - expr512
