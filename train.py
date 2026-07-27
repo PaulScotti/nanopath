@@ -437,23 +437,37 @@ def main():
             "unique_patches_seen": unique_tiles_seen * unique_tile_patch_count,
         }
 
-    # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
-    # schedule values. Used by both the train step and evaluate() (no_grad).
+    # Compute the objectives for one batch. Training keeps the half furthest from deterministic,
+    # batch-local teacher centroids; validation retains every tile for a comparable diagnostic.
     def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
-            t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
-            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
+            keep = torch.ones(b, dtype=torch.bool, device=device)
+            if student_backbone.training:
+                tile_embed = F.normalize(t["x_norm_clstoken"].view(train_cfg["global_views"], b, -1).float().mean(0), dim=-1)
+                n_centroids = 8
+                centroids = tile_embed[torch.arange(n_centroids, device=device) * b // n_centroids]
+                for _ in range(3):  # A fixed bound keeps selection cheap and reproducible per batch.
+                    membership = F.one_hot(torch.cdist(tile_embed, centroids).argmin(1), n_centroids).float()
+                    count = membership.sum(0)
+                    centroids = torch.where(count[:, None] > 0, membership.T @ tile_embed / count.clamp_min(1)[:, None], centroids)
+                distance = torch.cdist(tile_embed, centroids).min(1).values
+                keep[:] = False
+                keep[torch.argsort(distance, descending=True, stable=True)[: b // 2]] = True
+            t_cls = teacher_dino_head(t["x_norm_clstoken"].view(2, b, -1)[:, keep].flatten(0, 1)).chunk(2)
+            t_prob = torch.stack(sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).chunk(2))
+            view_keep = keep.repeat(train_cfg["global_views"])
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
         L = train_cfg["local_views"]
-        local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
-        global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
+        local_loss = sum(dino_ce(x[keep], y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
+        global_loss = dino_ce(sg_cls.view(2, b, -1)[:, keep].flatten(0, 1), t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         target = F.layer_norm(t["x_norm_patchtokens"].flatten(0, 1), (student_backbone.embed_dim,))[mask_idx]
         pred = student_predictor(sg["x_norm_patchtokens"], cond).flatten(0, 1)[mask_idx]
-        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
-        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
+        jepa_keep = view_keep[:, None].expand_as(masks)[masks]
+        jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w * jepa_keep).sum() / (keep.sum() * 2)
+        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x[keep], dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
         # FINO metadata guidance on the CLS token (train-only; meta=None in eval), orthogonal to the JEPA patch
         # objective. lambda_meta=0.03/branch; GradScale gates the encoder gradient by the DANN ramp gamma with the
         # per-factor sign (+ M+ encourage / - M- suppress). fp32 island (1/tau=0.023 too sharp for bf16); missing
@@ -467,7 +481,7 @@ def main():
             terms = []  # (factor, per-branch loss 0.03*L_t); combined below, optionally gradient-equalized
             with torch.autocast(device_type="cuda", enabled=False):
                 for j, (f, sign) in enumerate(fino_disc):
-                    lab = md[:, j].repeat(train_cfg["global_views"]); ok = lab >= 0  # repeat, NOT interleave
+                    lab = md[:, j].repeat(train_cfg["global_views"]); ok = (lab >= 0) & view_keep  # repeat, NOT interleave
                     if ok.any():
                         logits = (GradScale.apply(phi_s[ok], sign * gamma) @ protos[f].t()) / 0.023
                         terms.append((f, 0.03 * F.cross_entropy(logits, lab[ok])))
@@ -481,7 +495,7 @@ def main():
                 # for the cosine discrete branch and it strips the radial magnitude). raw_cls=True feeds the raw CLS.
                 cls_cont = sg["x_norm_clstoken"].float() if fino_cfg.get("raw_cls") else phi_s
                 for f, sign in fino_cont:
-                    val = mc[f].repeat(train_cfg["global_views"], 1); ok = ~torch.isnan(val).any(dim=1)
+                    val = mc[f].repeat(train_cfg["global_views"], 1); ok = ~torch.isnan(val).any(dim=1) & view_keep
                     if ok.any():
                         cpred = predictors[f](GradScale.apply(cls_cont[ok], sign * gamma))
                         terms.append((f, 0.03 * F.mse_loss(cpred, val[ok])))
