@@ -39,17 +39,6 @@ dino:
   lr_min: 1.0e-06
   patch_embed_lr_mult: 0.2
   warmup_fraction: 0.0909
-fino:
-  continuous:
-  - - expr512
-    - 1
-  - - fga
-    - 1
-  discrete:
-  - - subtype
-    - 1
-  enabled: true
-  gamma_max: 0.7
 model:
   type: dinov2_vits14_reg
 probe:
